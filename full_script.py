@@ -47,7 +47,7 @@ warnings.filterwarnings("ignore")
 # ============================================================
 
 # ---------------- USER SETTINGS ----------------
-FOLDER = r"DIRECTORY"
+FOLDER = r"C:\Users\flulec1\OneDrive - Louisiana State University\LSU\300. Projects\FlowMatching"
 BRIDGE_FILES = [f"bridge{i}.csv" for i in range(1, 6)]
 BRIDGE_NAMES = [os.path.splitext(f)[0] for f in BRIDGE_FILES]
 
@@ -65,6 +65,10 @@ MIN_NPERSEG = 256
 SV1_SMOOTH_SIGMA = 1.25
 TEST_FRAC = 0.20
 DROP_WORST_WINDOW_FRACTION = 0.10
+
+# Train/test split
+SPLIT_MODE = "blocked"      # options: "blocked", "random"
+TEST_BLOCK_POSITION = "end" # options for blocked split: "end", "start"
 
 # Balance total window counts across bridges for fair comparison
 BALANCE_TOTAL_WINDOWS = True
@@ -316,13 +320,13 @@ def curve_derivative_features(curves):
 def sliding_windows(arr, win_len, step):
     n = len(arr)
     if n < win_len:
-        yield arr
+        yield 0, arr
         return
     starts = list(range(0, max(n - win_len + 1, 1), step))
     if not starts or starts[-1] != n - win_len:
         starts.append(n - win_len)
     for st in sorted(set(starts)):
-        yield arr[st: st + win_len]
+        yield st, arr[st: st + win_len]
 
 
 def pearson_corr(a, b):
@@ -363,7 +367,8 @@ def balance_curve_count(curves, target_n, seed=42):
 
 
 def build_window_curves(raw, fs, common_freq):
-    curves_all = []
+    window_records = []
+
     for window_seconds in WINDOW_SECONDS_LIST:
         win_len = int(round(window_seconds * fs))
         if win_len >= len(raw):
@@ -371,34 +376,68 @@ def build_window_curves(raw, fs, common_freq):
             win_len = len(raw) // k
             if win_len < MIN_NPERSEG:
                 continue
+
         step = max(1, int(round(win_len * (1.0 - WINDOW_OVERLAP))))
-        for w in sliding_windows(raw, win_len, step):
+
+        for st, w in sliding_windows(raw, win_len, step):
             if len(w) < MIN_NPERSEG:
                 continue
             try:
                 f, sv1 = compute_fdd_sv1(w, fs)
-                curves_all.append(sv1_to_curve(f, sv1, common_freq))
+                curve = sv1_to_curve(f, sv1, common_freq)
+
+
+                mid = st + 0.5 * len(w)
+                window_records.append({
+                    "start": st,
+                    "end": st + len(w),
+                    "mid": mid,
+                    "duration_samples": len(w),
+                    "curve": curve,
+                })
             except Exception:
                 continue
-    curves = np.asarray(curves_all, dtype=np.float32)
-    if len(curves) < MIN_WINDOWS_PER_BRIDGE:
-        raise ValueError(f"Only {len(curves)} valid windows created.")
+
+    if len(window_records) < MIN_WINDOWS_PER_BRIDGE:
+        raise ValueError(f"Only {len(window_records)} valid windows created.")
+
+    # Put all multi-scale windows into one temporal sequence before filtering,
+    # balancing, and splitting.
+    window_records = sorted(window_records, key=lambda r: (r["mid"], r["duration_samples"], r["start"]))
+    curves = np.asarray([r["curve"] for r in window_records], dtype=np.float32)
+
     curves = filter_noisy_windows(curves, drop_fraction=DROP_WORST_WINDOW_FRACTION)
     if len(curves) < MIN_WINDOWS_PER_BRIDGE:
         raise ValueError(f"Only {len(curves)} windows remain after filtering.")
     return curves
 
 
-def split_train_test(curves, test_frac=0.2, seed=42):
-    rng = np.random.default_rng(seed)
-    idx = np.arange(len(curves))
-    rng.shuffle(idx)
-    n_test = max(1, int(round(len(curves) * test_frac)))
-    test_idx = np.sort(idx[:n_test])
-    train_idx = np.sort(idx[n_test:])
-    if len(train_idx) == 0:
-        train_idx = test_idx[:1]
-        test_idx = test_idx[1:] if len(test_idx) > 1 else test_idx
+def split_train_test(curves, test_frac=0.2, seed=42, split_mode=SPLIT_MODE):
+    curves = np.asarray(curves, dtype=np.float32)
+    n = len(curves)
+    n_test = max(1, int(round(n * test_frac)))
+    n_train = n - n_test
+
+    if n_train <= 0:
+        return curves[:1], curves[1:] if n > 1 else curves[:1]
+
+    if split_mode.lower() == "blocked":
+
+        if TEST_BLOCK_POSITION.lower() == "start":
+            train_idx = np.arange(n_test, n)
+            test_idx = np.arange(0, n_test)
+        else:
+            train_idx = np.arange(0, n_train)
+            test_idx = np.arange(n_train, n)
+    elif split_mode.lower() == "random":
+        rng = np.random.default_rng(seed)
+        idx = np.arange(n)
+        rng.shuffle(idx)
+        test_idx = np.sort(idx[:n_test])
+        train_idx = np.sort(idx[n_test:])
+    else:
+        raise ValueError(f"Unknown SPLIT_MODE={split_mode!r}. Use 'blocked' or 'random'.")
+
     return curves[train_idx], curves[test_idx]
 
 
@@ -476,7 +515,7 @@ def load_all_bridges():
     data = {}
     summary_rows = []
 
-    print("Building multi-scale window-level SV1 samples with train/test split...")
+    print(f"Building multi-scale window-level SV1 samples with {SPLIT_MODE} train/test split...")
     raw_store = {}
     fs_store = {}
     window_store = {}
@@ -533,14 +572,20 @@ def load_all_bridges():
         summary_rows.append({
             "bridge": bname,
             "fs": fs_store[bname],
+            "split_mode": SPLIT_MODE,
+            "test_block_position": TEST_BLOCK_POSITION if SPLIT_MODE.lower() == "blocked" else "",
             "n_total_windows_original": original_counts[bname],
             "n_total_windows_balanced": len(balanced_curves),
             "n_train_windows": len(train_curves),
             "n_test_windows": len(test_curves),
         })
 
+        split_desc = (
+            f"{SPLIT_MODE}({TEST_BLOCK_POSITION})"
+            if SPLIT_MODE.lower() == "blocked" else SPLIT_MODE
+        )
         print(
-            f"  {bname}: fs={fs_store[bname]:.3f} Hz, "
+            f"  {bname}: fs={fs_store[bname]:.3f} Hz, split={split_desc}, "
             f"original={original_counts[bname]}, balanced={len(balanced_curves)}, "
             f"train={len(train_curves)}, test={len(test_curves)}"
         )
@@ -1133,8 +1178,18 @@ def evaluate_center_reconstructions(data_dict, cfm_model, pca, train_centers_ful
 
 
 
+
+
+
+
+
+
+
+
+
+
 # ============================================================
-# ISLA
+# INTERACTIVE PLOT
 # ============================================================
 def make_background(latent_xy_train, centers):
     x_min, x_max = latent_xy_train[:, 0].min(), latent_xy_train[:, 0].max()
